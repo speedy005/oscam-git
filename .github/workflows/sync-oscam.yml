@@ -20,7 +20,7 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - name: Checkout GitHub fork
+      - name: Checkout GitHub repository
         uses: actions/checkout@v5
         with:
           ref: master
@@ -34,60 +34,58 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Fetch upstream
+      - name: Fetch branches
         shell: bash
         run: |
           set -euo pipefail
+
           git remote add upstream https://git.streamboard.tv/common/oscam.git
           git fetch --no-tags upstream master
           git fetch --no-tags origin master
+          git fetch --no-tags origin github-workflows || true
 
-      - name: Synchronize with Streamboard and preserve workflows
-        id: sync
+      - name: Preserve workflows in separate branch
         shell: bash
         run: |
           set -euo pipefail
 
-          git checkout master
-
-          # Back up all GitHub Actions workflow files.
-          BACKUP_DIR="$(mktemp -d)"
-          trap 'rm -rf "$BACKUP_DIR"' EXIT
-
-          if [ -d .github/workflows ]; then
-            cp -a .github/workflows "$BACKUP_DIR/workflows"
+          # Prefer the existing workflow branch.
+          if git show-ref --verify --quiet refs/remotes/origin/github-workflows; then
+            git checkout -B github-workflows origin/github-workflows
+          else
+            # On the first run, copy workflows from the current master.
+            git checkout -B github-workflows origin/master
           fi
 
-          # Remember the current upstream commit.
-          UPSTREAM_COMMIT="$(git rev-parse upstream/master)"
-          echo "UPSTREAM_COMMIT=$UPSTREAM_COMMIT" >> "$GITHUB_ENV"
-
-          echo "Streamboard commit: $UPSTREAM_COMMIT"
-
-          # Reset master to the exact upstream commit.
-          git reset --hard "$UPSTREAM_COMMIT"
-
-          # Restore our own workflow files.
-          if [ -d "$BACKUP_DIR/workflows" ]; then
-            mkdir -p .github/workflows
-            cp -a "$BACKUP_DIR/workflows/." .github/workflows/
+          # Ensure the workflow directory exists before attempting to save it.
+          if [ ! -d .github/workflows ]; then
+            echo "::error::No .github/workflows directory found to preserve."
+            exit 1
           fi
 
-          # Stage only the workflow directory.
           git add -A -- .github/workflows
 
-          # Commit only if workflow files differ from upstream.
           if ! git diff --cached --quiet; then
             git commit -m "Preserve GitHub Actions workflows"
           fi
 
-          echo "Local commit: $(git rev-parse HEAD)"
+          git push --force origin github-workflows
 
-      - name: Push updates to GitHub
+      - name: Synchronize master exactly with Streamboard
         shell: bash
         run: |
           set -euo pipefail
-          git push --force-with-lease origin master
+
+          UPSTREAM_COMMIT="$(git rev-parse upstream/master)"
+
+          echo "UPSTREAM_COMMIT=$UPSTREAM_COMMIT" >> "$GITHUB_ENV"
+          echo "Streamboard commit: $UPSTREAM_COMMIT"
+
+          # Point master directly to the upstream commit.
+          git checkout -B master "$UPSTREAM_COMMIT"
+
+          # No additional workflow commit is created on master.
+          git push --force origin master
 
       - name: Verify synchronization
         shell: bash
@@ -95,19 +93,18 @@ jobs:
           set -euo pipefail
 
           git fetch --no-tags origin master
+          git fetch --no-tags upstream master
 
           LOCAL_COMMIT="$(git rev-parse origin/master)"
+          UPSTREAM_COMMIT="$(git rev-parse upstream/master)"
 
-          echo "GitHub commit: $LOCAL_COMMIT"
+          echo "GitHub master: $LOCAL_COMMIT"
           echo "Streamboard:   $UPSTREAM_COMMIT"
 
-          # Verify that everything outside .github/workflows matches upstream.
-          git diff --exit-code \
-            "$UPSTREAM_COMMIT" origin/master \
-            -- . ':(exclude).github/workflows'
-
-          # Ensure the workflow directory exists on GitHub.
-          git cat-file -e origin/master:.github/workflows
+          if [ "$LOCAL_COMMIT" != "$UPSTREAM_COMMIT" ]; then
+            echo "::error::GitHub master is not identical to Streamboard master."
+            exit 1
+          fi
 
           echo "Synchronization verified successfully."
 
@@ -129,13 +126,14 @@ jobs:
           **Upstream:** https://git.streamboard.tv/common/oscam
           **Fork:** https://github.com/${GH_REPO}
           **Branch:** master
+          **Workflow-Branch:** github-workflows
 
           Mögliche Ursachen:
           - Streamboard nicht erreichbar
           - Push- oder Berechtigungsfehler
           - Branch-Schutzregeln verhindern das Aktualisieren
-          - Fehler beim Wiederherstellen der Workflow-Dateien
-          - Fehler bei der Überprüfung der Synchronisierung
+          - Workflow-Dateien konnten nicht gesichert werden
+          - Die Commit-Prüfung ist fehlgeschlagen
 
           [Workflow-Ausführung und Fehlerprotokoll ansehen](${RUN_URL})
 
@@ -143,7 +141,6 @@ jobs:
           EOF
           )
 
-          # Create the label if it does not exist.
           gh label create sync-error \
             --repo "$GH_REPO" \
             --color "d73a4a" \
